@@ -1,0 +1,98 @@
+import logging
+import requests
+import json
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+
+# Настройка логирования
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Токен бота
+TOKEN = "YOUR_TOKEN_BOT"
+
+# Путь к файлу для хранения данных о поиске пулов
+POOLS_FILE = "pools_data.json"
+
+# Функция для загрузки данных из файла
+def load_pools():
+    try:
+        with open(POOLS_FILE, "r") as file:
+            return json.load(file)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        logger.error("Ошибка при чтении файла %s", POOLS_FILE)
+        return {}
+
+# Функция для сохранения данных в файл
+def save_pools(pools_data):
+    with open(POOLS_FILE, "w") as file:
+        json.dump(pools_data, file)
+
+# Словарь для хранения данных о найденных пулах
+pools_data = load_pools()
+
+# Функция для команды /hunt
+async def hunt_pools(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("Команда /hunt вызвана пользователем %s", update.effective_user.id)
+    await update.message.reply_text("Начинаем поиск подходящих пулов на платформе Meteora...")
+
+    try:
+        # Запрос всех пулов без параметров
+        url = "https://dlmm-api.meteora.ag/pair/all"
+        response = requests.get(url)
+
+        if response.status_code == 200:
+            pools = response.json()
+            save_pools(pools)  # Сохранение данных в файл после запроса
+            suitable_pools = []
+
+            # Фильтрация пулов по критериям
+            for pool in pools:
+                if (
+                    pool.get("bin_step") == 100 and
+                    float(pool.get("liquidity", 0)) >= 10000 and
+                    float(pool.get("apr", 0)) > 50
+                ):
+                    suitable_pools.append(pool)
+
+            if suitable_pools:
+                message = "Найдены подходящие пулы:\n"
+                for pool in suitable_pools:
+                    message += f"Пул: {pool.get('name', 'Неизвестно')}, Адрес: {pool.get('address', 'Неизвестно')}\n"
+                await update.message.reply_text(message)
+            else:
+                await update.message.reply_text("Подходящие пулы не найдены.")
+        else:
+            await update.message.reply_text("Ошибка при запросе данных о пулах.")
+    except Exception as e:
+        logger.error("Ошибка при поиске пулов: %s", e)
+        await update.message.reply_text("Ошибка при поиске пулов.")
+
+# Главная функция
+def main() -> None:
+    # Создаем приложение Telegram бота
+    application = ApplicationBuilder().token(TOKEN).build()
+
+    # Добавляем обработчики команд
+    application.add_handler(CommandHandler("hunt", hunt_pools))
+
+    # Кнопки постоянного меню
+    keyboard = [["/hunt"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+
+    # Обработчик команды /start для отображения меню
+    async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.message.reply_text(
+            "Привет! Я бот для поиска пулов на платформе Meteora. Вот доступные команды:",
+            reply_markup=reply_markup
+        )
+    application.add_handler(CommandHandler("start", start))
+
+    # Запускаем бота в режиме polling
+    application.run_polling()
+
+# Запуск основного процесса
+if __name__ == "__main__":
+    main()
