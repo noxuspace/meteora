@@ -1,0 +1,211 @@
+import logging
+import json
+import aiohttp
+import asyncio
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+import requests
+
+# Настройка логирования
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Токен бота
+TOKEN = "YOUR_TOKEN_BOT"
+
+# Путь к файлу для хранения данных о токенах
+TOKENS_FILE = "tokens_data.json"
+
+# Функция для загрузки данных из файла
+def load_tokens():
+    try:
+        with open(TOKENS_FILE, "r") as file:
+            return json.load(file)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        logger.error("Ошибка при чтении файла %s", TOKENS_FILE)
+        return {}
+
+# Функция для сохранения данных в файл
+def save_tokens(tokens_data):
+    with open(TOKENS_FILE, "w") as file:
+        json.dump(tokens_data, file)
+
+# Словарь для хранения данных о токенах
+tokens_data = load_tokens()
+
+# Флаги для отслеживания состояния цены
+price_state = {
+    "increased_10_percent": False,
+    "decreased_35_percent": False,
+    "back_to_normal": False
+}
+
+# Функция для команды /add
+async def add_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("Команда /add вызвана пользователем %s", update.effective_user.id)
+    await update.message.reply_text("Пожалуйста, введите контракт токена:")
+    context.user_data['awaiting_contract'] = True
+
+# Функция для команды /up
+async def set_upper_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("Команда /up вызвана пользователем %s", update.effective_user.id)
+    await update.message.reply_text("Пожалуйста, введите начальную цену:")
+    context.user_data['awaiting_upper_price'] = True
+
+# Функция для команды /down
+async def set_lower_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("Команда /down вызвана пользователем %s", update.effective_user.id)
+    await update.message.reply_text("Пожалуйста, введите конечную цену:")
+    context.user_data['awaiting_lower_price'] = True
+
+# Функция для команды /price
+async def get_current_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if "contract" in tokens_data:
+        contract = tokens_data["contract"]
+        try:
+            response = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{contract}")
+            if response.status_code == 200:
+                data = response.json()
+                if "pairs" in data and len(data["pairs"]) > 0:
+                    # Фильтрация по пулу meteora
+                    pairs = [pair for pair in data["pairs"] if pair["dexId"] == "meteora"]
+                    if len(pairs) > 0:
+                        price = float(pairs[0]["priceNative"])
+                        await update.message.reply_text(f"Текущая цена для токена {contract} с пула meteora: {price}")
+                    else:
+                        await update.message.reply_text("Пул meteora не найден для данного контракта.")
+                else:
+                    await update.message.reply_text("Информация о цене недоступна.")
+            else:
+                await update.message.reply_text("Ошибка при запросе данных о цене.")
+        except Exception as e:
+            logger.error("Ошибка при получении данных о цене: %s", e)
+            await update.message.reply_text("Ошибка при получении данных о цене.")
+    else:
+        await update.message.reply_text("Контракт токена не добавлен. Пожалуйста, используйте команду /add для добавления контракта.")
+
+# Функция для обработки сообщений пользователя
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text
+
+    if context.user_data.get('awaiting_contract'):
+        tokens_data["contract"] = text.strip()
+        save_tokens(tokens_data)
+        await update.message.reply_text(f"Контракт токена {text.strip()} успешно добавлен.")
+        context.user_data['awaiting_contract'] = False
+    elif context.user_data.get('awaiting_upper_price'):
+        try:
+            start_price = float(text.strip().replace(',', '.'))
+            tokens_data["start_price"] = f"{start_price:.15f}"
+            save_tokens(tokens_data)
+            await update.message.reply_text(f"Начальная цена обновлена до {start_price:.15f}")
+        except ValueError:
+            await update.message.reply_text("Ошибка в формате числа. Убедитесь, что цена введена правильно.")
+        context.user_data['awaiting_upper_price'] = False
+    elif context.user_data.get('awaiting_lower_price'):
+        try:
+            final_price = float(text.strip().replace(',', '.'))
+            tokens_data["final_price"] = f"{final_price:.15f}"
+            save_tokens(tokens_data)
+            await update.message.reply_text(f"Конечная цена обновлена до {final_price:.15f}")
+        except ValueError:
+            await update.message.reply_text("Ошибка в формате числа. Убедитесь, что цена введена правильно.")
+        context.user_data['awaiting_lower_price'] = False
+    else:
+        await update.message.reply_text("Неизвестная команда. Используйте кнопки меню.")
+
+# Функция для мониторинга цен
+async def check_price():
+    while True:
+        if "contract" in tokens_data and "start_price" in tokens_data and "final_price" in tokens_data:
+            contract = tokens_data["contract"]
+            start_price = float(tokens_data.get("start_price", 0))
+            final_price = float(tokens_data.get("final_price", 0))
+            try:
+                response = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{contract}")
+                if response.status_code == 200:
+                    data = response.json()
+                    if "pairs" in data and len(data["pairs"]) > 0:
+                        # Фильтрация по пулу meteora
+                        pairs = [pair for pair in data["pairs"] if pair["dexId"] == "meteora"]
+                        if len(pairs) > 0:
+                            price = float(pairs[0]["priceNative"])
+
+                            # Проверка увеличения цены на 10%
+                            if price >= start_price * 1.10 and not price_state["increased_10_percent"]:
+                                logger.info("Цена токена %s увеличилась на 10%%", contract)
+                                await send_notification(f"Цена токена {contract} увеличилась на 10%")
+                                price_state["increased_10_percent"] = True
+                                price_state["back_to_normal"] = False
+
+                            # Проверка падения цены на 35%
+                            elif price <= start_price * 0.65 and not price_state["decreased_35_percent"]:
+                                logger.info("Цена токена %s упала на 35%%", contract)
+                                await send_notification(f"Цена токена {contract} упала на 35%")
+                                price_state["decreased_35_percent"] = True
+                                price_state["increased_10_percent"] = False
+
+                            # Проверка возврата цены в нормальный диапазон
+                            elif start_price * 0.65 < price < start_price and not price_state["back_to_normal"]:
+                                logger.info("Цена токена %s вернулась в нормальный диапазон", contract)
+                                await send_notification(f"Цена токена {contract} вернулась в нормальный диапазон")
+                                price_state["back_to_normal"] = True
+                                price_state["decreased_35_percent"] = False
+                                price_state["increased_10_percent"] = False
+            except Exception as e:
+                logger.error("Ошибка при получении данных о цене: %s", e)
+
+        await asyncio.sleep(5)  # Проверяем каждые 5 секунд
+
+# Функция для отправки уведомления
+async def send_notification(message: str):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {
+        "chat_id": "YOUR_USER_ID",  # Ваш ID пользователя
+        "text": message
+    }
+    try:
+        response = requests.post(url, json=payload)
+        if response.status_code != 200:
+            logger.error("Ошибка при отправке уведомления: %s", response.text)
+    except Exception as e:
+        logger.error("Ошибка при отправке уведомления: %s", e)
+
+# Главная функция
+def main() -> None:
+    # Создаем приложение Telegram бота
+    application = ApplicationBuilder().token(TOKEN).build()
+
+    # Добавляем обработчики команд
+    application.add_handler(CommandHandler("add", add_token))
+    application.add_handler(CommandHandler("up", set_upper_price))
+    application.add_handler(CommandHandler("down", set_lower_price))
+    application.add_handler(CommandHandler("price", get_current_price))
+
+    # Кнопки постоянного меню
+    keyboard = [["/add"], ["/up"], ["/down"], ["/price"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+
+    # Обработчик команды /start для отображения меню
+    async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.message.reply_text(
+            "Привет! Я бот для отслеживания цен токенов на Solana. Вот доступные команды:",
+            reply_markup=reply_markup
+        )
+    application.add_handler(CommandHandler("start", start))
+
+    # Обработчик текстовых команд
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Запускаем мониторинг цен
+    loop = asyncio.get_event_loop()
+    loop.create_task(check_price())
+
+    # Запускаем бота в режиме polling
+    application.run_polling()
+
+# Запуск основного процесса
+if __name__ == "__main__":
+    main()
